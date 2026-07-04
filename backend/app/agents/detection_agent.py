@@ -6,6 +6,16 @@ from pydantic import BaseModel, Field
 import cv2
 import numpy as np
 import torch
+# Patch torch.load to default weights_only to False to support YOLOv8 model loading in PyTorch 2.6+
+import functools
+original_torch_load = torch.load
+@functools.wraps(original_torch_load)
+def patched_torch_load(*args, **kwargs):
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return original_torch_load(*args, **kwargs)
+torch.load = patched_torch_load
+
 from ultralytics import YOLO
 
 # Configure logging

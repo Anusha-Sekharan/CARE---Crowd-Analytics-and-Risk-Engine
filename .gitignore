@@ -1,0 +1,15 @@
+# Virtual Environments
+venv/
+backend/venv/
+
+# Python caching
+__pycache__/
+**/__pycache__/
+
+# YOLO Weights
+*.pt
+backend/yolov8n.pt
+
+# Local data databases/images
+data/
+backend/data/

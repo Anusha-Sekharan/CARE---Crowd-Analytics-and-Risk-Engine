@@ -33,7 +33,7 @@ class LLMSafetyAdvisorAgent:
     summaries, and incident reports based on telemetry data.
     """
     
-    def __init__(self, ollama_url: str = "http://localhost:11434/api/generate", model_name: str = "qwen3:8b"):
+    def __init__(self, ollama_url: str = "http://localhost:11434/api/generate", model_name: str = "llama3.1:8b"):
         """
         Initializes the LLM connection parameters.
         """
@@ -107,7 +107,6 @@ Do not include any other conversational text.
         """
         Executes the LLM advice generation workflow.
         """
-        prompt = _build_prompt(self, data) # Wait, need self._build_prompt
         prompt = self._build_prompt(data)
         
         # For testing without a running Ollama server, we can mock the response here if needed,

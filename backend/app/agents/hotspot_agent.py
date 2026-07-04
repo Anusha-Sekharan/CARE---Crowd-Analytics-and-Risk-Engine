@@ -14,12 +14,7 @@ if not logger.handlers:
 
 # --- Schemas ---
 
-class BoundingBox(BaseModel):
-    x_min: int = Field(..., description="Top-left X coordinate")
-    y_min: int = Field(..., description="Top-left Y coordinate")
-    x_max: int = Field(..., description="Bottom-right X coordinate")
-    y_max: int = Field(..., description="Bottom-right Y coordinate")
-    confidence: float = Field(..., description="Detection confidence score")
+from app.agents.detection_agent import BoundingBox
 
 class HotspotInput(BaseModel):
     people_count: int = Field(..., description="Total number of people detected")

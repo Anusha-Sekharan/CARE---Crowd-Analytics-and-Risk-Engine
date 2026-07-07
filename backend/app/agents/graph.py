@@ -43,7 +43,8 @@ def node_hotspot(state: CrowdState) -> CrowdState:
             people_count=state["people_count"],
             bounding_boxes=state["bounding_boxes"],
             image_width=w,
-            image_height=h
+            image_height=h,
+            density_map=getattr(agent_detection, 'last_density_map', None)
         )
         
         # Analytics

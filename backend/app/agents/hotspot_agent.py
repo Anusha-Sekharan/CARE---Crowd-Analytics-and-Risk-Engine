@@ -21,6 +21,7 @@ class HotspotInput(BaseModel):
     bounding_boxes: List[BoundingBox] = Field(..., description="List of bounding boxes for detected people")
     image_width: int = Field(..., description="Width of the original image")
     image_height: int = Field(..., description="Height of the original image")
+    density_map: Any = None
 
 class HotspotOutput(BaseModel):
     zone_counts: Dict[str, int] = Field(..., description="Dictionary mapping zone names to people counts")
@@ -57,10 +58,11 @@ class HotspotDetectionAgent:
 
     def analyze_zones(self, data: HotspotInput) -> HotspotOutput:
         """
-        Analyzes the bounding boxes to count people in each grid zone.
+        Analyzes the crowd density to count people in each grid zone.
+        Supports both the direct CSRNet density map and fallback bounding boxes.
         
         Args:
-            data: HotspotInput containing bounding boxes and image dimensions.
+            data: HotspotInput containing bounding boxes, image dimensions, and optional density map.
             
         Returns:
             HotspotOutput schema with zone counts and the identified hotspot.
@@ -71,29 +73,45 @@ class HotspotDetectionAgent:
             for c in range(self.grid_cols):
                 zone_counts[self._get_zone_name(r, c)] = 0
 
-        if not data.bounding_boxes:
-            return HotspotOutput(zone_counts=zone_counts, hotspot_zone=None, max_zone_count=0)
-
-        # Calculate width and height of each cell
-        cell_width = data.image_width / self.grid_cols
-        cell_height = data.image_height / self.grid_rows
+        # If density map is present, sum values in each grid cell directly (highly accurate)
+        if data.density_map is not None:
+            dm_height, dm_width = data.density_map.shape[:2]
+            cell_width = dm_width / self.grid_cols
+            cell_height = dm_height / self.grid_rows
+            
+            for r in range(self.grid_rows):
+                for c in range(self.grid_cols):
+                    x_start = int(c * cell_width)
+                    x_end = int((c + 1) * cell_width)
+                    y_start = int(r * cell_height)
+                    y_end = int((r + 1) * cell_height)
+                    
+                    # Sum density values in this grid cell (pixels sum to total count)
+                    zone_sum = np.sum(data.density_map[y_start:y_end, x_start:x_end])
+                    zone_name = self._get_zone_name(r, c)
+                    zone_counts[zone_name] = int(round(max(0.0, float(zone_sum))))
         
-        for bbox in data.bounding_boxes:
-            # Calculate the center point of the bounding box (pedestrian location)
-            center_x = (bbox.x_min + bbox.x_max) / 2
-            center_y = (bbox.y_min + bbox.y_max) / 2
+        # Fallback to bounding boxes if no density map is present
+        elif data.bounding_boxes:
+            cell_width = data.image_width / self.grid_cols
+            cell_height = data.image_height / self.grid_rows
             
-            # Determine which grid column and row this center point falls into
-            col_idx = int(center_x // cell_width)
-            row_idx = int(center_y // cell_height)
-            
-            # Clamp indices in case the bounding box center is exactly on the image edge
-            col_idx = max(0, min(col_idx, self.grid_cols - 1))
-            row_idx = max(0, min(row_idx, self.grid_rows - 1))
-            
-            zone_name = self._get_zone_name(row_idx, col_idx)
-            zone_counts[zone_name] += 1
-            
+            for bbox in data.bounding_boxes:
+                # Calculate the center point of the bounding box (pedestrian location)
+                center_x = (bbox.x_min + bbox.x_max) / 2
+                center_y = (bbox.y_min + bbox.y_max) / 2
+                
+                # Determine which grid column and row this center point falls into
+                col_idx = int(center_x // cell_width)
+                row_idx = int(center_y // cell_height)
+                
+                # Clamp indices in case the bounding box center is exactly on the image edge
+                col_idx = max(0, min(col_idx, self.grid_cols - 1))
+                row_idx = max(0, min(row_idx, self.grid_rows - 1))
+                
+                zone_name = self._get_zone_name(row_idx, col_idx)
+                zone_counts[zone_name] += 1
+                
         # Identify the hotspot
         hotspot_zone = None
         max_count = -1
@@ -114,11 +132,11 @@ class HotspotDetectionAgent:
     def generate_heatmap_overlay(self, image: np.ndarray, data: HotspotInput) -> np.ndarray:
         """
         Generates a visual heatmap overlay using OpenCV.
-        Creates a KDE-like gaussian density map based on bounding box centers.
+        Supports both the direct CSRNet density map and fallback bounding boxes.
         
         Args:
             image: The original image numpy array (BGR).
-            data: HotspotInput containing bounding boxes.
+            data: HotspotInput containing bounding boxes and optional density map.
             
         Returns:
             A new numpy array containing the image blended with the heatmap.
@@ -128,20 +146,37 @@ class HotspotDetectionAgent:
             
         height, width = image.shape[:2]
         
-        # Create an empty floating point accumulator map
+        # If density map is present, resize and colorize it directly (highly accurate)
+        if data.density_map is not None:
+            # Resize density map to match original image size
+            density_map_resized = cv2.resize(data.density_map, (width, height), interpolation=cv2.INTER_CUBIC)
+            density_map_resized = np.clip(density_map_resized, 0, None)
+            
+            # Normalize density map to [0, 255] for colormap
+            max_val = np.max(density_map_resized)
+            if max_val > 0:
+                density_map_normalized = (density_map_resized / max_val) * 255.0
+            else:
+                density_map_normalized = density_map_resized
+                
+            density_map_uint8 = np.uint8(density_map_normalized)
+            
+            # Apply color map
+            heatmap_color = cv2.applyColorMap(density_map_uint8, cv2.COLORMAP_JET)
+            
+            # Blend with original image
+            alpha = 0.5  # heatmap transparency
+            overlay = cv2.addWeighted(heatmap_color, alpha, image, 1 - alpha, 0)
+            return overlay
+            
+        # Fallback to creating a KDE-like gaussian density map from bounding boxes
         density_map = np.zeros((height, width), dtype=np.float32)
-        
-        # Parameters for the gaussian blob
-        # The size of the blob represents the approximate physical area of a person
         sigma = min(width, height) // 20 
         
         for bbox in data.bounding_boxes:
             cx = int((bbox.x_min + bbox.x_max) / 2)
             cy = int((bbox.y_min + bbox.y_max) / 2)
             
-            # Add a value at the center point. 
-            # In a highly optimized system, we would add the 2D gaussian directly here.
-            # For performance and simplicity, we increment points and blur later.
             if 0 <= cx < width and 0 <= cy < height:
                 density_map[cy, cx] += 1.0
                 
@@ -154,7 +189,7 @@ class HotspotDetectionAgent:
             
         density_map = np.uint8(density_map)
         
-        # Apply a colormap (JET or INFERNO works well for heatmaps)
+        # Apply a colormap (JET works well for heatmaps)
         heatmap_color = cv2.applyColorMap(density_map, cv2.COLORMAP_JET)
         
         # Blend the heatmap with the original image

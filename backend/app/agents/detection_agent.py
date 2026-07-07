@@ -16,7 +16,8 @@ def patched_torch_load(*args, **kwargs):
     return original_torch_load(*args, **kwargs)
 torch.load = patched_torch_load
 
-from ultralytics import YOLO
+import scipy.ndimage as ndimage
+from app.models.csrnet import get_csrnet_model, CSRNet
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -50,16 +51,17 @@ class CrowdDetectionAgent:
     counting them, and calculating a crowd density score.
     """
     
-    def __init__(self, model_path: str = "yolov8n.pt", conf_threshold: float = 0.25):
+    def __init__(self, model_path: str = None, conf_threshold: float = 0.015):
         """
-        Initializes the agent, loads the YOLO model, and determines the best hardware device.
+        Initializes the agent, loads the CSRNet model, and determines the best hardware device.
         
         Args:
-            model_path: Path to the YOLO weights file. Defaults to YOLOv8 nano for speed.
-            conf_threshold: Minimum confidence threshold to consider a detection valid.
+            model_path: Path to the CSRNet weights file. Defaults to backend/data/CSRNet.pth.
+            conf_threshold: Minimum threshold in density map to consider a local peak a person.
         """
         self.model_path = model_path
         self.conf_threshold = conf_threshold
+        self.last_density_map = None
         
         # Determine the optimal device (CUDA, MPS, or CPU)
         self.device = self._get_optimal_device()
@@ -76,17 +78,17 @@ class CrowdDetectionAgent:
             return "mps"
         return "cpu"
 
-    def _load_model(self) -> YOLO:
-        """Loads the YOLO model into memory and moves it to the appropriate device."""
+    def _load_model(self) -> CSRNet:
+        """Loads the CSRNet model into memory and moves it to the appropriate device."""
         try:
-            logger.info(f"Loading YOLO model from {self.model_path}...")
-            # ultralytics handles downloading standard models if not found locally
-            model = YOLO(self.model_path)
-            model.to(self.device)
-            logger.info("YOLO model loaded successfully.")
+            from app.models.csrnet import WEIGHTS_PATH
+            path = self.model_path if self.model_path else WEIGHTS_PATH
+            logger.info(f"Loading CSRNet model from {path}...")
+            model = get_csrnet_model(weights_path=path, device=self.device)
+            logger.info("CSRNet model loaded successfully.")
             return model
         except Exception as e:
-            logger.error(f"Failed to load YOLO model: {str(e)}")
+            logger.error(f"Failed to load CSRNet model: {str(e)}")
             raise RuntimeError(f"Model initialization failed: {str(e)}")
 
     def _calculate_density(self, boxes: List[BoundingBox], image_area: int) -> float:
@@ -135,32 +137,91 @@ class CrowdDetectionAgent:
         start_time = time.perf_counter()
         
         try:
-            # Run inference
-            # YOLO class 0 is 'person' in the COCO dataset
-            results = self.model(image, conf=self.conf_threshold, classes=[0], verbose=False)
+            # Preprocess the image for CSRNet
+            # 1. Convert BGR to RGB
+            img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             
+            # 2. Scale pixels to [0, 1]
+            img = img.astype(np.float32) / 255.0
+            
+            # 3. ImageNet normalization
+            mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+            std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+            img = (img - mean) / std
+            
+            # 4. HWC to CHW format
+            img = img.transpose((2, 0, 1))
+            
+            # 5. Convert to tensor and send to compute device
+            img_tensor = torch.from_numpy(img).unsqueeze(0).to(self.device)
+            
+            # Run CSRNet inference
+            with torch.no_grad():
+                output = self.model(img_tensor)
+                
+            # Density map is the single-channel output
+            density_map = output.squeeze().cpu().numpy()
+            
+            # Clip negative values to 0 since density cannot be negative
+            density_map = np.clip(density_map, 0.0, None)
+            
+            # Store the density map on the instance so other agents (HotspotAgent) can access it
+            self.last_density_map = density_map
+            
+            # Sum density map values to get total crowd count
+            # CSRNet maps represent pixel density of crowd, sum(map) equals total people count
+            predicted_count = float(np.sum(density_map))
+            people_count = int(round(predicted_count))
+            
+            # Extract local peaks (heads) from density map to generate pseudo-bounding boxes
+            # This maintains backward compatibility with downstream agents expecting bounding boxes
             bounding_boxes = []
+            scale = 8 # CSRNet output is 1/8 of original image dimensions due to pooling layers
             
-            # Parse results (assuming single image batch)
-            result = results[0]
-            boxes = result.boxes
+            # Find local maxima in a 3x3 neighborhood
+            neighborhood_size = 3
+            data_max = ndimage.maximum_filter(density_map, neighborhood_size)
+            maxima = (density_map == data_max)
             
-            for box in boxes:
-                # Extract coordinates and convert to standard integers
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                conf = float(box.conf[0])
+            # Filter background noise using threshold
+            data_min = ndimage.minimum_filter(density_map, neighborhood_size)
+            diff = ((data_max - data_min) > self.conf_threshold)
+            maxima[diff == 0] = 0
+            
+            # Find peaks using labeling
+            labeled, num_objects = ndimage.label(maxima)
+            slices = ndimage.find_objects(labeled)
+            
+            for dy, dx in slices:
+                y_center = (dy.start + dy.stop - 1) / 2.0
+                x_center = (dx.start + dx.stop - 1) / 2.0
+                
+                # Scale coordinates back to original image
+                orig_x = int(x_center * scale)
+                orig_y = int(y_center * scale)
+                
+                # Represent head as a 30x30 bounding box
+                size = 15
+                x_min = max(0, orig_x - size)
+                y_min = max(0, orig_y - size)
+                x_max = min(width - 1, orig_x + size)
+                y_max = min(height - 1, orig_y + size)
+                
+                conf = float(density_map[int(y_center), int(x_center)])
                 
                 bounding_boxes.append(
                     BoundingBox(
-                        x_min=int(x1),
-                        y_min=int(y1),
-                        x_max=int(x2),
-                        y_max=int(y2),
+                        x_min=x_min,
+                        y_min=y_min,
+                        x_max=x_max,
+                        y_max=y_max,
                         confidence=round(conf, 4)
                     )
                 )
                 
-            people_count = len(bounding_boxes)
+            # If the peak detection missed some heavily congested overlapping areas,
+            # we want to ensure the list of boxes still correlates reasonably with the count.
+            # However, people_count is the ground-truth estimate from the density map integral.
             density_score = self._calculate_density(bounding_boxes, image_area)
             
             inference_time_ms = (time.perf_counter() - start_time) * 1000
@@ -184,7 +245,7 @@ if __name__ == "__main__":
     dummy_image = np.zeros((720, 1280, 3), dtype=np.uint8)
     
     try:
-        agent = CrowdDetectionAgent(model_path="yolov8n.pt", conf_threshold=0.3)
+        agent = CrowdDetectionAgent()
         output = agent.process_image(dummy_image)
         print(output.model_dump_json(indent=2))
     except Exception as ex:

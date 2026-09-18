@@ -123,8 +123,8 @@ async def analyze_crowd_image(file: UploadFile = File(...), db: Session = Depend
             "incident_report": db_record.llm_incident_report,
         },
         "images": {
-            "original": f"/{local_path.replace(os.sep, '/')}",
-            "heatmap": f"/{db_record.heatmap_image_path.replace(os.sep, '/')}" if db_record.heatmap_image_path else None
+            "original": f"/images/{os.path.basename(local_path)}",
+            "heatmap": f"/images/{os.path.basename(db_record.heatmap_image_path)}" if db_record.heatmap_image_path else None
         },
         "errors": final_state.get("errors")
     }

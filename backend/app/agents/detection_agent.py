@@ -91,31 +91,46 @@ class CrowdDetectionAgent:
             logger.error(f"Failed to load CSRNet model: {str(e)}")
             raise RuntimeError(f"Model initialization failed: {str(e)}")
 
-    def _calculate_density(self, boxes: List[BoundingBox], image_area: int) -> float:
+    def _calculate_density_from_map(self, density_map: np.ndarray, people_count: int, image_area: int) -> float:
         """
-        Calculates a rudimentary density score based on the ratio of bounding box area
-        to the total image area. Overlapping boxes are not perfectly accounted for in this 
-        basic heuristic, but it serves as a solid baseline.
+        Calculates an accurate crowd density score (0.0 to 1.0) directly from the 
+        continuous CSRNet density map, measuring spatial coverage and local crowd pressure.
         
         Args:
-            boxes: List of BoundingBox objects.
-            image_area: Total area of the image in pixels.
+            density_map: 2D numpy array representing the crowd density.
+            people_count: Integral total crowd count.
+            image_area: Total image area in pixels.
             
         Returns:
             Float representing density score clamped between 0.0 and 1.0.
         """
-        if not boxes or image_area <= 0:
+        if density_map is None or density_map.size == 0 or people_count <= 0:
             return 0.0
             
-        total_bbox_area = 0
-        for box in boxes:
-            area = (box.x_max - box.x_min) * (box.y_max - box.y_min)
-            total_bbox_area += area
+        # 1. Spatial Coverage: What percentage of the frame contains active crowd density?
+        active_threshold = 0.003
+        active_pixels = np.count_nonzero(density_map > active_threshold)
+        total_pixels = density_map.size
+        spatial_coverage = active_pixels / max(1, total_pixels)
+        
+        # 2. Density Intensity: Relative concentration per unit area
+        # A packed crowd has average active pixel density >= 0.02 - 0.05
+        active_values = density_map[density_map > active_threshold]
+        if len(active_values) > 0:
+            mean_intensity = float(np.mean(active_values))
+            intensity_score = min(1.0, mean_intensity / 0.035)
+        else:
+            intensity_score = 0.0
             
-        # The density score could exceed 1.0 if there's heavy overlap. Clamp to 1.0.
-        # Alternatively, a more advanced approach calculates the union of all polygons.
-        density = min(total_bbox_area / image_area, 1.0)
-        return round(density, 4)
+        # 3. Crowd Volume Factor: Absolute people density relative to frame dimensions
+        # 1 person per ~15,000 pixels is moderate; 1 per ~3,000 pixels is packed
+        volume_factor = min(1.0, (people_count * 5000.0) / max(1, image_area))
+        
+        # Composite score
+        raw_density = (0.45 * spatial_coverage) + (0.35 * intensity_score) + (0.20 * volume_factor)
+        density_score = min(1.0, max(0.0, raw_density))
+        
+        return round(float(density_score), 4)
 
     def process_image(self, image: np.ndarray) -> DetectionOutput:
         """
@@ -219,10 +234,8 @@ class CrowdDetectionAgent:
                     )
                 )
                 
-            # If the peak detection missed some heavily congested overlapping areas,
-            # we want to ensure the list of boxes still correlates reasonably with the count.
-            # However, people_count is the ground-truth estimate from the density map integral.
-            density_score = self._calculate_density(bounding_boxes, image_area)
+            # Calculate density score directly from the continuous CSRNet density map
+            density_score = self._calculate_density_from_map(density_map, people_count, image_area)
             
             inference_time_ms = (time.perf_counter() - start_time) * 1000
             

@@ -56,20 +56,41 @@ class RiskAnalysisAgent:
             return 0.0
         return min(max_zone / total_people, 1.0)
 
-    def _calculate_congestion_score(self, density: float, concentration: float) -> int:
+    def _calculate_congestion_score(self, density: float, concentration: float, people_count: int) -> int:
         """
-        Mathematical Formula:
-        Congestion Score = (Density * Density_Weight) + (Concentration * Hotspot_Weight)
-        Mapped to a 0-100 scale.
+        Mathematical Formula for Multi-Factor Congestion & Crowd Pressure:
+        
+        1. Global Density Component (0-60 points): Direct continuous density score.
+        2. Crowd Volume Pressure (0-30 points): Accounts for absolute crowd size (e.g. 100-300+ people).
+        3. Hotspot Imbalance (0-20 points): Accounts for bottleneck surges where one zone is overloaded.
+        
+        This prevents packed uniform crowds (e.g. festival/concert) from being mistakenly marked LOW.
         """
         # Clamp inputs
         density = max(0.0, min(density, 1.0))
         concentration = max(0.0, min(concentration, 1.0))
         
-        raw_score = (density * self.density_weight) + (concentration * self.hotspot_weight)
-        score_100 = int(round(raw_score * 100))
+        # 1. Global Density (0-60)
+        density_part = density * 60.0
         
-        # Ensure it stays within bounds
+        # 2. Crowd Volume Factor (0-30) - scales with absolute head count
+        # >= 150 people reaches maximum volume pressure contribution (30 pts)
+        volume_part = min(30.0, (people_count / 150.0) * 30.0)
+        
+        # 3. Hotspot Imbalance (0-20) - baseline in a 3x3 grid is ~11% (0.111)
+        # Concentration above 20% indicates localized bottlenecks
+        hotspot_part = min(20.0, max(0.0, (concentration - 0.11)) * 40.0)
+        
+        # Aggregate raw score
+        raw_score = density_part + volume_part + hotspot_part
+        
+        # If density is extremely high (>= 0.75) and count >= 100, ensure floor is at least 75 (HIGH/CRITICAL)
+        if density >= 0.75 and people_count >= 100:
+            raw_score = max(raw_score, 80.0)
+        elif density >= 0.50 and people_count >= 50:
+            raw_score = max(raw_score, 62.0)
+            
+        score_100 = int(round(raw_score))
         return max(0, min(score_100, 100))
 
     def _determine_risk_level(self, congestion_score: int) -> RiskLevel:
@@ -90,7 +111,7 @@ class RiskAnalysisAgent:
         Executes the risk analysis algorithm.
         """
         concentration = self._calculate_hotspot_concentration(data.people_count, data.max_zone_count)
-        congestion_score = self._calculate_congestion_score(data.density_score, concentration)
+        congestion_score = self._calculate_congestion_score(data.density_score, concentration, data.people_count)
         risk_level = self._determine_risk_level(congestion_score)
         
         logger.info(f"Risk Analysis - Score: {congestion_score}, Level: {risk_level.value}")

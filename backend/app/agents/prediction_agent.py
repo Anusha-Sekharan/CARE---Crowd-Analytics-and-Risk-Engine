@@ -65,15 +65,21 @@ class PredictionAgent:
     def _estimate_stampede_risk(self, congestion: int, concentration: float, future_growth_ratio: float) -> int:
         """
         Mathematical Formula for Stampede Risk:
-        Stampede Risk = (Congestion * 0.5) + (Concentration * 100 * 0.3) + (Growth_Momentum * 0.2)
+        Stampede Risk = (Congestion * 0.60) + (Concentration * 100 * 0.25) + (Growth_Momentum * 0.15)
         
-        High concentration in a single spot + High overall congestion + Positive growth = Disaster Risk
+        If overall congestion is already critical (>= 75), baseline stampede risk is elevated.
         """
         momentum_score = min(100, max(0, (future_growth_ratio - 1.0) * 100 * 5)) # E.g., 5% growth -> 25 score
         
-        raw_risk = (congestion * 0.5) + (concentration * 100 * 0.3) + (momentum_score * 0.2)
-        risk_100 = int(round(raw_risk))
+        raw_risk = (congestion * 0.60) + (concentration * 100 * 0.25) + (momentum_score * 0.15)
         
+        # If congestion is already high (>= 75), ensure stampede risk is at least on par with congestion
+        if congestion >= 75:
+            raw_risk = max(raw_risk, congestion * 0.95)
+        elif congestion >= 60:
+            raw_risk = max(raw_risk, congestion * 0.85)
+            
+        risk_100 = int(round(raw_risk))
         return max(0, min(risk_100, 100))
 
     def predict_future_state(self, data: PredictionInput) -> PredictionOutput:

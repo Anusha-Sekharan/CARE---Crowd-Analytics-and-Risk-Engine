@@ -146,56 +146,68 @@ class HotspotDetectionAgent:
             
         height, width = image.shape[:2]
         
-        # If density map is present, resize and colorize it directly (highly accurate)
+        # If density map is present, resize and colorize it directly (CSRNet dense mode)
         if data.density_map is not None:
-            # Resize density map to match original image size
             density_map_resized = cv2.resize(data.density_map, (width, height), interpolation=cv2.INTER_CUBIC)
             density_map_resized = np.clip(density_map_resized, 0, None)
             
-            # Normalize density map to [0, 255] for colormap
             max_val = np.max(density_map_resized)
             if max_val > 0:
-                density_map_normalized = (density_map_resized / max_val) * 255.0
+                density_norm = (density_map_resized / max_val) * 255.0
             else:
-                density_map_normalized = density_map_resized
+                density_norm = density_map_resized
                 
-            density_map_uint8 = np.uint8(density_map_normalized)
+            density_uint8 = np.uint8(np.clip(density_norm, 0, 255))
+            heatmap_color = cv2.applyColorMap(density_uint8, cv2.COLORMAP_JET)
             
-            # Apply color map
-            heatmap_color = cv2.applyColorMap(density_map_uint8, cv2.COLORMAP_JET)
+            # Use dynamic alpha mask so zero-density regions remain clean and unmasked
+            alpha_mask = (density_uint8.astype(np.float32) / 255.0) * 0.55
+            alpha_3ch = np.repeat(alpha_mask[:, :, np.newaxis], 3, axis=2)
             
-            # Blend with original image
-            alpha = 0.5  # heatmap transparency
-            overlay = cv2.addWeighted(heatmap_color, alpha, image, 1 - alpha, 0)
+            overlay = (heatmap_color.astype(np.float32) * alpha_3ch + image.astype(np.float32) * (1.0 - alpha_3ch)).astype(np.uint8)
             return overlay
             
-        # Fallback to creating a KDE-like gaussian density map from bounding boxes
+        # Precise Person-Centric Heatmap (YOLO sparse mode)
         density_map = np.zeros((height, width), dtype=np.float32)
-        sigma = min(width, height) // 20 
         
         for bbox in data.bounding_boxes:
-            cx = int((bbox.x_min + bbox.x_max) / 2)
-            cy = int((bbox.y_min + bbox.y_max) / 2)
+            bw = bbox.x_max - bbox.x_min
+            bh = bbox.y_max - bbox.y_min
             
-            if 0 <= cx < width and 0 <= cy < height:
-                density_map[cy, cx] += 1.0
+            # Head/upper-body centroid
+            cx = int(bbox.x_min + bw / 2.0)
+            cy = int(bbox.y_min + min(bh / 3.0, 40.0))
+            
+            radius = max(15, int(min(bw, bh) * 0.6))
+            sigma = max(5.0, radius / 2.0)
+            
+            # Draw local Gaussian blob around person
+            y_min = max(0, cy - radius)
+            y_max = min(height, cy + radius + 1)
+            x_min = max(0, cx - radius)
+            x_max = min(width, cx + radius + 1)
+            
+            if y_max > y_min and x_max > x_min:
+                y_grid, x_grid = np.ogrid[y_min:y_max, x_min:x_max]
+                dist_sq = (x_grid - cx)**2 + (y_grid - cy)**2
+                gaussian_blob = np.exp(-dist_sq / (2.0 * sigma**2))
+                density_map[y_min:y_max, x_min:x_max] += gaussian_blob * 1.5
                 
-        # Apply a large gaussian blur to spread the density
-        density_map = cv2.GaussianBlur(density_map, (0, 0), sigmaX=sigma, sigmaY=sigma)
-        
-        # Normalize the density map to [0, 255] for coloring
-        if np.max(density_map) > 0:
-            density_map = (density_map / np.max(density_map)) * 255
+        # Normalize and colorize
+        max_val = np.max(density_map)
+        if max_val > 0:
+            density_norm = (density_map / max_val) * 255.0
+        else:
+            density_norm = density_map
             
-        density_map = np.uint8(density_map)
+        density_uint8 = np.uint8(np.clip(density_norm, 0, 255))
+        heatmap_color = cv2.applyColorMap(density_uint8, cv2.COLORMAP_JET)
         
-        # Apply a colormap (JET works well for heatmaps)
-        heatmap_color = cv2.applyColorMap(density_map, cv2.COLORMAP_JET)
+        # Smooth alpha mask: high heat glows brightly over people, zero heat leaves background natural
+        alpha_mask = np.clip((density_uint8.astype(np.float32) / 255.0) * 0.65, 0.0, 0.65)
+        alpha_3ch = np.repeat(alpha_mask[:, :, np.newaxis], 3, axis=2)
         
-        # Blend the heatmap with the original image
-        alpha = 0.5  # heatmap transparency
-        overlay = cv2.addWeighted(heatmap_color, alpha, image, 1 - alpha, 0)
-        
+        overlay = (heatmap_color.astype(np.float32) * alpha_3ch + image.astype(np.float32) * (1.0 - alpha_3ch)).astype(np.uint8)
         return overlay
 
 # --- Example Usage ---
